@@ -1,0 +1,39 @@
+{
+  "name": "@dollardeploy/brevo-cli",
+  "version": "1.0.0",
+  "description": "Brevo API client and contacts/templates management CLI (zero dependencies, uses native fetch)",
+  "main": "api.js",
+  "bin": {
+    "brevo-cli": "cli.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dollardeploy/brevo-cli.git"
+  },
+  "homepage": "https://github.com/dollardeploy/brevo-cli",
+  "files": [
+    "api.js",
+    "cli.js",
+    "README.md"
+  ],
+  "keywords": [
+    "brevo",
+    "sendinblue",
+    "contacts",
+    "newsletter",
+    "transactional",
+    "templates",
+    "cli"
+  ],
+  "author": "DollarDeploy",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "npm:publish": "npm publish --access public"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

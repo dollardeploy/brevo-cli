@@ -25,6 +25,10 @@ with `xkeysib-`).
 export BREVO_API_KEY="xkeysib-..."
 ```
 
+Alternatively, drop this in a `.env.production` file in the directory you run
+from — the CLI loads it automatically on startup. Variables already set in the
+environment always take precedence over the file.
+
 ## CLI Usage
 
 ```bash

@@ -2,6 +2,10 @@
 
 const fs = require("fs");
 
+if (fs.existsSync(".env.production")) {
+  process.loadEnvFile(".env.production");
+}
+
 const BrevoAPI = require("./api");
 
 const logger = console;

@@ -28,16 +28,31 @@ const logger = console;
 // Brevo allows up to 1000 records per list request.
 const MAX_PAGE_SIZE = 1000;
 
-// Flags that never take a value.
-const BOOLEAN_FLAGS = new Set(["json", "active", "inactive", "update"]);
+// Brevo allows up to 50 records per /contacts/lists request.
+const MAX_LISTS_PAGE_SIZE = 50;
 
-const USAGE = `brevo-cli — manage Brevo contacts and transactional templates from the command line
+// Brevo allows up to 100 records per /emailCampaigns request.
+const MAX_CAMPAIGNS_PAGE_SIZE = 100;
+
+// Page size used to walk /smtp/statistics/events (Brevo maximum is 5000).
+const EVENTS_PAGE_SIZE = 2500;
+
+const DEFAULT_TEMPLATE_EVENTS = "requests,delivered,opened,clicks";
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+// Flags that never take a value.
+const BOOLEAN_FLAGS = new Set(["json", "active", "inactive", "update", "count", "daily"]);
+
+const USAGE = `brevo-cli - manage Brevo contacts and transactional templates, check e-mail stats
 
 Usage:
   brevo-cli <group> <command> [arguments] [options]
+  brevo-cli lists | stats [options]
 
 Contact commands:
-  contacts list                    List contacts (auto-paginates over 1000 / "all")
+  contacts list                    List contacts (auto-paginates over 1000 / "all"), no e-mails in the table
+  contacts show <email>            Show one contact: attributes, lists, blacklist state, message statistics
   contacts add <email>             Create a contact
   contacts remove <email>          Delete a contact permanently
   contacts subscribe <email>       Re-subscribe (emailBlacklisted = false)
@@ -49,6 +64,15 @@ Template commands (transactional / automated emails):
   templates add --name "..."       Create a template
   templates edit <id>              Update a template
 
+Read-only reporting commands:
+  lists                            Contact lists: id, name, subscribers, blacklisted
+  stats                            Transactional e-mail totals for the last --days (default 30)
+  stats --daily                    One row per day for the last --days (default 14), incl. days with 0 sent
+  stats --template <id>            Event counts and unique recipients for one template (default 30 days)
+  campaigns list                   E-mail campaigns with delivered, opens and clicks
+
+Automation workflows have no public Brevo API, so there is no command for them.
+
 Connection options:
   --key <api-key>                  Brevo API key (default: BREVO_API_KEY)
   --url <base-url>                 API base URL (default: BREVO_API_URL or https://api.brevo.com/v3)
@@ -58,8 +82,21 @@ Contact options:
   --list <id1,id2>                 [add] List IDs to add the contact to
   --no-subscribe                   [add] Create the contact already unsubscribed
   --update                         [add] Update the contact if it already exists
-  --limit <n|all>                  [list] How many to return (default 50)
+  --limit <n|all>                  [list] How many to return (default 50, "all" with --since)
   --offset <n>                     [list] Starting offset (default 0)
+  --since <date|Nd>                [list] Created since YYYY-MM-DD, ISO timestamp or N days ago (7d)
+  --modified-since <date|Nd>       [list] Modified since YYYY-MM-DD, ISO timestamp or N days ago
+  --count                          [list] Print only the number of matching contacts
+
+Stats and campaign options:
+  --days <n>                       Days to report (default 30, 14 with --daily)
+  --daily                          [stats] One row per day
+  --template <id>                  [stats] Report events of one transactional template
+  --event <e1,e2>                  [stats --template] Events to count (default ${DEFAULT_TEMPLATE_EVENTS}),
+                                   any of requests, delivered, opened, clicks, hardBounces, softBounces,
+                                   bounces, spam, unsubscribed, blocked, invalid, deferred, error
+  --status <status>                [campaigns list] draft, sent, archive, queued, suspended, in_process
+  --limit <n|all> / --offset <n>   [campaigns list, lists] Pagination
 
 Template options:
   --name <name>                    Template name
@@ -82,6 +119,14 @@ Environment:
 
 Examples:
   brevo-cli contacts list --limit all
+  brevo-cli contacts list --since 7d --count        # contacts created in the last 7 days
+  brevo-cli contacts list --since 2026-10-23
+  brevo-cli contacts show jane@example.com
+  brevo-cli lists
+  brevo-cli stats --days 30
+  brevo-cli stats --daily --days 14
+  brevo-cli stats --template 1 --days 30
+  brevo-cli campaigns list --status sent
   brevo-cli contacts add jane@example.com --attrs "FIRSTNAME=Jane,LASTNAME=Doe" --list 3
   brevo-cli contacts unsubscribe jane@example.com
   brevo-cli contacts subscribe jane@example.com
@@ -157,7 +202,14 @@ function readInput(value) {
 
 // Fetch a list resource across pages using Brevo's limit/offset pagination,
 // then trim to the requested limit. `key` is the array property in the response.
-async function paginate(listFn, key, baseQuery, options, defaultLimit) {
+async function paginate(
+  listFn,
+  key,
+  baseQuery,
+  options,
+  defaultLimit,
+  maxPageSize = MAX_PAGE_SIZE
+) {
   const limit = options.limit || defaultLimit;
   const fetchAll = limit === "all";
   const target = fetchAll ? Infinity : Number(limit);
@@ -167,10 +219,7 @@ async function paginate(listFn, key, baseQuery, options, defaultLimit) {
   let total = 0;
 
   while (collected.length < target) {
-    const pageSize = Math.min(
-      MAX_PAGE_SIZE,
-      fetchAll ? MAX_PAGE_SIZE : target - collected.length
-    );
+    const pageSize = Math.min(maxPageSize, fetchAll ? maxPageSize : target - collected.length);
     const result = await listFn({ ...baseQuery, limit: pageSize, offset });
 
     if (result && typeof result.count === "number") {
@@ -221,6 +270,60 @@ function truncate(text, max) {
   return value.length > max ? `${value.slice(0, max - 1)}…` : value;
 }
 
+function printJson(value) {
+  logger.info(JSON.stringify(value, null, 2));
+}
+
+// Print aligned "Label:  value" lines.
+function printFields(fields) {
+  const width = fields.reduce((max, [label]) => Math.max(max, label.length), 0) + 2;
+  fields.forEach(([label, value]) => logger.info(`${`${label}:`.padEnd(width)}${value}`));
+}
+
+function parsePositiveInt(value, name, defaultValue) {
+  if (value === undefined) {
+    return defaultValue;
+  }
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < 1) {
+    throw new Error(`--${name} must be a positive integer, got "${value}".`);
+  }
+  return number;
+}
+
+// Accepts "7d" (7 days ago), "YYYY-MM-DD" (start of that day, UTC) or a full ISO timestamp,
+// returns the ISO timestamp Brevo expects in createdSince / modifiedSince.
+function parseSince(value, name) {
+  const text = String(value);
+  const daysAgo = /^(\d+)d$/.exec(text);
+  if (daysAgo) {
+    return new Date(Date.now() - Number(daysAgo[1]) * DAY_MS).toISOString();
+  }
+  const isoDate = /^\d{4}-\d{2}-\d{2}$/.test(text) ? `${text}T00:00:00.000Z` : text;
+  const date = new Date(isoDate);
+  if (value === true || !/^\d{4}-\d{2}-\d{2}/.test(text) || Number.isNaN(date.getTime())) {
+    throw new Error(
+      `--${name} must be YYYY-MM-DD, an ISO timestamp or Nd (e.g. 7d), got "${value}".`
+    );
+  }
+  return date.toISOString();
+}
+
+// YYYY-MM-DD of a Date in UTC.
+const toDay = date => date.toISOString().slice(0, 10);
+
+async function fetchAllLists(api) {
+  const { items } = await paginate(
+    query => api.contacts.lists(query),
+    "lists",
+    {},
+    { limit: "all" },
+    "all",
+    MAX_LISTS_PAGE_SIZE
+  );
+  return items;
+}
+
 // ---- Contacts --------------------------------------------------------------
 
 function parseAttrs(value) {
@@ -242,22 +345,42 @@ function parseAttrs(value) {
 }
 
 async function contactsList(api, options) {
-  const { items, total, fetched } = await paginate(
-    query => api.contacts.list(query),
-    "contacts",
-    {},
-    options,
-    50
-  );
+  const filters = {};
+  if (options.since !== undefined) {
+    filters.createdSince = parseSince(options.since, "since");
+  }
+  if (options["modified-since"] !== undefined) {
+    filters.modifiedSince = parseSince(options["modified-since"], "modified-since");
+  }
+  const filtered = Object.keys(filters).length > 0;
 
-  if (options.json) {
-    logger.info(JSON.stringify(items, null, 2));
+  if (options.count) {
+    const result = await api.contacts.list({ ...filters, limit: 1, offset: 0 });
+    const count = (result && result.count) || 0;
+    if (options.json) {
+      printJson({ count, ...filters });
+      return;
+    }
+    logger.info(String(count));
     return;
   }
 
+  const { items, total, fetched } = await paginate(
+    query => api.contacts.list(query),
+    "contacts",
+    filters,
+    options,
+    filtered ? "all" : 50
+  );
+
+  if (options.json) {
+    printJson(items);
+    return;
+  }
+
+  // No e-mail column: table output never shows addresses, use --json or "contacts show".
   printTable(
     [
-      { key: "email", header: "email", value: c => c.email || "" },
       { key: "id", header: "id", value: c => c.id || "" },
       {
         key: "status",
@@ -270,6 +393,60 @@ async function contactsList(api, options) {
     items
   );
   logger.info(`\nShowing ${fetched} of ${total} contacts.`);
+}
+
+// Number of entries in a contact statistics field (an array of events, or nested arrays).
+function countEvents(value) {
+  if (Array.isArray(value)) {
+    return value.length;
+  }
+  if (value && typeof value === "object") {
+    return Object.values(value).reduce((sum, nested) => sum + countEvents(nested), 0);
+  }
+  return 0;
+}
+
+async function contactsShow(api, email, options) {
+  const [contact, lists] = await Promise.all([api.contacts.get(email), fetchAllLists(api)]);
+
+  if (options.json) {
+    printJson(contact);
+    return;
+  }
+
+  const listNames = new Map(lists.map(list => [list.id, list.name]));
+  const listIds = contact.listIds || [];
+  const statistics = contact.statistics || {};
+  const attributes = Object.entries(contact.attributes || {});
+
+  printFields([
+    ["ID", contact.id],
+    ["Email", contact.email || ""],
+    ["Email blacklisted", contact.emailBlacklisted ? "yes" : "no"],
+    ["SMS blacklisted", contact.smsBlacklisted ? "yes" : "no"],
+    ["Created", contact.createdAt || ""],
+    ["Modified", contact.modifiedAt || ""],
+    [
+      "Lists",
+      listIds.length
+        ? listIds.map(id => `${id} (${listNames.get(id) || "unknown"})`).join(", ")
+        : "none"
+    ],
+    ["Sent", countEvents(statistics.messagesSent)],
+    ["Delivered", countEvents(statistics.delivered)],
+    ["Opened", countEvents(statistics.opened)],
+    ["Clicked", countEvents(statistics.clicked)],
+    ["Hard bounces", countEvents(statistics.hardBounces)],
+    ["Soft bounces", countEvents(statistics.softBounces)],
+    ["Unsubscriptions", countEvents(statistics.unsubscriptions)]
+  ]);
+
+  logger.info("\nAttributes:");
+  if (!attributes.length) {
+    logger.info("  none");
+    return;
+  }
+  printFields(attributes.map(([key, value]) => [`  ${key}`, value]));
 }
 
 async function contactsAdd(api, email, options) {
@@ -484,11 +661,225 @@ async function templatesEdit(api, id, options) {
   logger.info(`Updated template ${id}.`);
 }
 
+// ---- Lists -----------------------------------------------------------------
+
+async function listsList(api, options) {
+  const { items, total, fetched } = await paginate(
+    query => api.contacts.lists(query),
+    "lists",
+    {},
+    options,
+    "all",
+    MAX_LISTS_PAGE_SIZE
+  );
+
+  if (options.json) {
+    printJson(items);
+    return;
+  }
+
+  printTable(
+    [
+      { key: "id", header: "id", value: l => l.id || "" },
+      { key: "name", header: "name", value: l => truncate(l.name, 40) },
+      { key: "subscribers", header: "subscribers", value: l => l.uniqueSubscribers || 0 },
+      { key: "blacklisted", header: "blacklisted", value: l => l.totalBlacklisted || 0 }
+    ],
+    items
+  );
+  logger.info(`\nShowing ${fetched} of ${total} lists.`);
+}
+
+// ---- Stats -----------------------------------------------------------------
+
+// Transactional e-mail metrics shared by the aggregated report and the daily rows.
+const STAT_METRICS = [
+  { key: "requests", header: "requests", label: "Requests" },
+  { key: "delivered", header: "delivered", label: "Delivered" },
+  { key: "opens", header: "opens", label: "Opens" },
+  { key: "uniqueOpens", header: "uniq opens", label: "Unique opens" },
+  { key: "clicks", header: "clicks", label: "Clicks" },
+  { key: "uniqueClicks", header: "uniq clicks", label: "Unique clicks" },
+  { key: "hardBounces", header: "hard bounces", label: "Hard bounces" },
+  { key: "softBounces", header: "soft bounces", label: "Soft bounces" },
+  { key: "spamReports", header: "spam", label: "Spam reports" },
+  { key: "unsubscribed", header: "unsub", label: "Unsubscribed" }
+];
+
+const emptyStatsDay = date =>
+  STAT_METRICS.reduce((row, metric) => Object.assign(row, { [metric.key]: 0 }), { date });
+
+async function statsAggregated(api, options) {
+  const days = parsePositiveInt(options.days, "days", 30);
+  const report = await api.stats.aggregated({ days });
+
+  if (options.json) {
+    printJson(report);
+    return;
+  }
+
+  printFields([
+    ["Range", String(report.range || "").replace("|", " .. ")],
+    ...STAT_METRICS.map(metric => [metric.label, report[metric.key] || 0])
+  ]);
+}
+
+async function statsDaily(api, options) {
+  const days = parsePositiveInt(options.days, "days", 14);
+  const end = new Date();
+  const start = new Date(end.getTime() - (days - 1) * DAY_MS);
+  const result = await api.stats.daily({ startDate: toDay(start), endDate: toDay(end) });
+
+  // Brevo omits days without any event, fill them with zeros so they stay visible.
+  const reportsByDay = new Map(((result && result.reports) || []).map(row => [row.date, row]));
+  const rows = Array.from({ length: days }, (_, index) => {
+    const date = toDay(new Date(start.getTime() + index * DAY_MS));
+    return { ...emptyStatsDay(date), ...reportsByDay.get(date) };
+  });
+
+  if (options.json) {
+    printJson(rows);
+    return;
+  }
+
+  printTable(
+    [
+      { key: "date", header: "date", value: row => row.date },
+      ...STAT_METRICS.map(metric => ({
+        key: metric.key,
+        header: metric.header,
+        value: row => row[metric.key] || 0
+      }))
+    ],
+    rows
+  );
+}
+
+// Walk all events of one type for a template and count events and unique recipients.
+// Addresses are only used for the unique count, they are never printed.
+async function countTemplateEvents(api, templateId, days, event) {
+  const recipients = new Set();
+  let events = 0;
+  let offset = 0;
+
+  for (;;) {
+    const result = await api.stats.events({
+      templateId,
+      days,
+      event,
+      limit: EVENTS_PAGE_SIZE,
+      offset,
+      sort: "desc"
+    });
+    const batch = (result && result.events) || [];
+    events += batch.length;
+    batch.forEach(item => recipients.add(String(item.email || "").toLowerCase()));
+    offset += batch.length;
+    if (batch.length < EVENTS_PAGE_SIZE) {
+      break;
+    }
+  }
+
+  return { event, events, uniqueRecipients: recipients.size };
+}
+
+async function statsTemplate(api, options) {
+  const templateId = parsePositiveInt(options.template, "template");
+  const days = parsePositiveInt(options.days, "days", 30);
+  const eventNames = String(options.event || DEFAULT_TEMPLATE_EVENTS)
+    .split(",")
+    .map(name => name.trim())
+    .filter(Boolean);
+
+  const counts = [];
+  for (const event of eventNames) {
+    counts.push(await countTemplateEvents(api, templateId, days, event));
+  }
+
+  if (options.json) {
+    printJson({ templateId, days, events: counts });
+    return;
+  }
+
+  logger.info(`Template ${templateId}, last ${days} days:\n`);
+  printTable(
+    [
+      { key: "event", header: "event", value: row => row.event },
+      { key: "events", header: "events", value: row => row.events },
+      {
+        key: "uniqueRecipients",
+        header: "unique recipients",
+        value: row => row.uniqueRecipients
+      }
+    ],
+    counts
+  );
+}
+
+function stats(api, options) {
+  if (options.template !== undefined) {
+    return statsTemplate(api, options);
+  }
+  if (options.daily) {
+    return statsDaily(api, options);
+  }
+  return statsAggregated(api, options);
+}
+
+// ---- Campaigns -------------------------------------------------------------
+
+async function campaignsList(api, options) {
+  const baseQuery = {
+    statistics: "globalStats",
+    excludeHtmlContent: true,
+    sort: "desc"
+  };
+  if (options.status) {
+    baseQuery.status = options.status;
+  }
+
+  const { items, total, fetched } = await paginate(
+    query => api.campaigns.list(query),
+    "campaigns",
+    baseQuery,
+    options,
+    50,
+    MAX_CAMPAIGNS_PAGE_SIZE
+  );
+
+  if (options.json) {
+    printJson(items);
+    return;
+  }
+
+  const globalStats = campaign =>
+    (campaign.statistics && campaign.statistics.globalStats) || {};
+
+  printTable(
+    [
+      { key: "id", header: "id", value: c => c.id || "" },
+      { key: "name", header: "name", value: c => truncate(c.name, 30) },
+      { key: "subject", header: "subject", value: c => truncate(c.subject, 40) },
+      { key: "status", header: "status", value: c => c.status || "" },
+      { key: "sent", header: "sent", value: c => (c.sentDate || "").slice(0, 10) },
+      { key: "delivered", header: "delivered", value: c => globalStats(c).delivered || 0 },
+      { key: "opens", header: "opens", value: c => globalStats(c).uniqueViews || 0 },
+      { key: "clicks", header: "clicks", value: c => globalStats(c).uniqueClicks || 0 }
+    ],
+    items
+  );
+  logger.info(`\nShowing ${fetched} of ${total} campaigns.`);
+}
+
 // ---- Dispatch --------------------------------------------------------------
 
 const COMMANDS = {
   contacts: {
     list: { run: (api, args, options) => contactsList(api, options) },
+    show: {
+      needsArg: "email",
+      run: (api, args, options) => contactsShow(api, args[0], options)
+    },
     add: {
       needsArg: "email",
       run: (api, args, options) => contactsAdd(api, args[0], options)
@@ -514,7 +905,16 @@ const COMMANDS = {
     },
     add: { run: (api, args, options) => templatesAdd(api, options) },
     edit: { needsArg: "id", run: (api, args, options) => templatesEdit(api, args[0], options) }
+  },
+  campaigns: {
+    list: { run: (api, args, options) => campaignsList(api, options) }
   }
+};
+
+// Commands without a sub-command, i.e. "brevo-cli stats".
+const SINGLE_COMMANDS = {
+  lists: { run: (api, args, options) => listsList(api, options) },
+  stats: { run: (api, args, options) => stats(api, options) }
 };
 
 async function main() {
@@ -525,10 +925,22 @@ async function main() {
     return;
   }
 
+  const singleCommand = SINGLE_COMMANDS[group];
+  if (singleCommand) {
+    if (command) {
+      throw new Error(
+        `"${group}" takes no sub-command, got "${command}". See "brevo-cli --help".`
+      );
+    }
+    await singleCommand.run(createClient(options), args, options);
+    return;
+  }
+
   const groupCommands = COMMANDS[group];
   if (!groupCommands) {
+    const groups = [...Object.keys(COMMANDS), ...Object.keys(SINGLE_COMMANDS)].join(", ");
     throw new Error(
-      `Unknown group "${group}". Expected "contacts" or "templates". See "brevo-cli --help".`
+      `Unknown group "${group}". Expected one of: ${groups}. See "brevo-cli --help".`
     );
   }
 

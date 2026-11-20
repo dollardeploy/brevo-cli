@@ -85,7 +85,18 @@ function BrevoAPI(options = {}) {
       create: data => request("POST", "/contacts", { body: data }),
       update: (identifier, data) =>
         request("PUT", `/contacts/${encode(identifier)}`, { body: data }),
-      remove: identifier => request("DELETE", `/contacts/${encode(identifier)}`)
+      remove: identifier => request("DELETE", `/contacts/${encode(identifier)}`),
+      lists: query => request("GET", "/contacts/lists", { query })
+    },
+
+    stats: {
+      aggregated: query => request("GET", "/smtp/statistics/aggregatedReport", { query }),
+      daily: query => request("GET", "/smtp/statistics/reports", { query }),
+      events: query => request("GET", "/smtp/statistics/events", { query })
+    },
+
+    campaigns: {
+      list: query => request("GET", "/emailCampaigns", { query })
     },
 
     templates: {

@@ -1,6 +1,6 @@
 ---
 name: brevo-cli
-description: Use when managing Brevo (Sendinblue) from the terminal — listing/adding/removing contacts, subscribing or unsubscribing them from marketing email, or listing/showing/adding/editing transactional email templates (welcome/automated emails). Triggers on "brevo contacts", "brevo templates", "unsubscribe contact", "transactional template", "edit welcome email", "brevo api cli".
+description: Use when managing Brevo (Sendinblue) from the terminal — listing/adding/removing contacts, subscribing or unsubscribing them from marketing email, or listing/showing/adding/editing transactional email templates (welcome/automated emails), or checking read-only e-mail stats (sent/delivered/opens per day or per template), contact lists, campaigns and whether new sign-ups reach Brevo. Triggers on "brevo contacts", "brevo templates", "unsubscribe contact", "transactional template", "edit welcome email", "brevo stats", "are emails going out", "brevo sync check", "brevo api cli".
 ---
 
 # Brevo CLI (brevo-cli)
@@ -29,6 +29,10 @@ brevo-cli <group> <command> [options]
 | -------------- | --------------------------------------------------------------------------- |
 | List contacts  | `brevo-cli contacts list [--limit 20] [--offset 40] [--json]`               |
 | List everyone  | `brevo-cli contacts list --limit all` (auto-paginates)                      |
+| Created since  | `brevo-cli contacts list --since 7d` (or `2026-10-23`, ISO timestamp)       |
+| Count only     | `brevo-cli contacts list --since 7d --count`                                |
+| Modified since | `brevo-cli contacts list --modified-since 2026-11-01`                       |
+| One contact    | `brevo-cli contacts show jane@example.com`                                  |
 | Add contact    | `brevo-cli contacts add jane@example.com --attrs "FIRSTNAME=Jane" --list 3` |
 | Add (upsert)   | `brevo-cli contacts add jane@example.com --update`                          |
 | Remove contact | `brevo-cli contacts remove jane@example.com`                                |
@@ -38,6 +42,30 @@ brevo-cli <group> <command> [options]
 `subscribe`/`unsubscribe` toggle the contact's **`emailBlacklisted`** flag
 (marketing email opt-in/out). They do **not** add or remove the contact from
 lists — use `--list` on `add` for list membership.
+
+The `contacts list` table has no e-mail column; `contacts show` (one contact)
+and `--json` do include the address. `contacts show` message statistics cover
+campaigns only, not transactional e-mails.
+
+## Reporting (read only)
+
+| Task                          | Command                                                        |
+| ----------------------------- | -------------------------------------------------------------- |
+| Contact lists                 | `brevo-cli lists`                                              |
+| E-mail totals                 | `brevo-cli stats --days 30`                                    |
+| Per day (0-sent days visible) | `brevo-cli stats --daily --days 14`                            |
+| One template (e.g. welcome)   | `brevo-cli stats --template 1 --days 30`                       |
+| Pick events                   | `brevo-cli stats --template 1 --event delivered,opened,clicks` |
+| Campaigns                     | `brevo-cli campaigns list --status sent`                       |
+
+Typical sync check: compare `contacts list --since 7d --count` with the number
+of sign-ups in the same period; a lower Brevo count means the user sync is
+broken and new users miss the automation e-mails. `stats --daily` rows with 0
+requests show days when nothing was sent.
+
+Brevo has **no public API for automation workflows** (`/automation/workflows`
+returns 404), so there is no command for them; check an automation through the
+template it sends with `stats --template <id>`.
 
 ## Templates (transactional / automated emails)
 
@@ -77,6 +105,6 @@ Template fields: `--name`, `--subject`, `--html` (file path or inline),
 ## Library Use
 
 `api.js` can be required directly:
-`contacts.{list,get,create,update,remove}`, `templates.{list,get,create,update}`,
-`account.get()`, and a low-level `request(method, path, {query, body})` for any
+`contacts.{list,get,create,update,remove,lists}`, `templates.{list,get,create,update}`,
+`stats.{aggregated,daily,events}`, `campaigns.list()`, `account.get()`, and a low-level `request(method, path, {query, body})` for any
 other Brevo endpoint. See `README.md`.
